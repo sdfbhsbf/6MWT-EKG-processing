@@ -9,6 +9,8 @@ Enters the 6MWT START time.
 The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) later.
 
 @author: beier
+
+Sept 2026 - v1
 """
 
 import csv
@@ -58,7 +60,6 @@ def get_csv_rows(uploaded_file,nrows=7):
     return rows
 
 def extract_recording_metadata(uploaded_file):
-    channel_row = 5
     sampling_row = 6
     data_start = 7
     rows = get_csv_rows(uploaded_file,nrows=data_start)
@@ -83,19 +84,8 @@ def extract_recording_metadata(uploaded_file):
         except Exception:
             collection_length = np.nan
 
-    channel_names = [str(c).strip() for c in rows[channel_row]]
-    ekg_candidates = [i for i,c in enumerate(channel_names) if c.upper().startswith("EKG")]
-
-    if len(ekg_candidates) == 0:
-        raise ValueError(f"Could not identify an EKG channel.\n\nDetected channels: {channel_names}")
-
-    ekg_signal_idx = ekg_candidates[0]
-    sampling_values = rows[sampling_row]
-
-    if ekg_signal_idx >= len(sampling_values):
-        raise ValueError("Could not find EKG sampling frequency.")
-
-    sampling_text = str(sampling_values[ekg_signal_idx]).replace("Hz","").strip()
+    # EKG sampling frequency is in column B of row 7
+    sampling_text = str(rows[sampling_row][1]).replace("Hz","").strip()
 
     try:
         ekg_fs = float(sampling_text)
@@ -105,27 +95,30 @@ def extract_recording_metadata(uploaded_file):
     return {
         "recording_start":recording_start,
         "collection_length":collection_length,
-        "channel_names":channel_names,
-        "ekg_signal_idx":ekg_signal_idx,
         "ekg_fs":ekg_fs,
-        "data_start":data_start}
+        "data_start":data_start
+    }
 
 def load_ekg(uploaded_file,metadata_info):
     uploaded_file.seek(0)
+
     ekg_raw = pd.read_csv(
         uploaded_file,
         skiprows=metadata_info["data_start"],
         header=None,
-        usecols=[metadata_info["ekg_signal_idx"]]
+        usecols=[0,1],
+        names=["Time","EKG"]
     )
-    ekg_raw.columns = ["EKG"]
-    ekg_signal = pd.to_numeric(ekg_raw["EKG"],errors="coerce")
-    ekg_signal = ekg_signal.dropna().reset_index(drop=True)
 
-    if len(ekg_signal) == 0:
+    ekg_raw["Time"] = pd.to_numeric(ekg_raw["Time"],errors="coerce")
+    ekg_raw["EKG"] = pd.to_numeric(ekg_raw["EKG"],errors="coerce")
+
+    ekg_raw = ekg_raw.dropna(subset=["Time","EKG"]).reset_index(drop=True)
+
+    if len(ekg_raw) == 0:
         raise ValueError("No valid numeric EKG data found.")
 
-    return ekg_signal.to_numpy()
+    return ekg_raw["Time"].to_numpy(),ekg_raw["EKG"].to_numpy()
 
 def parse_manual_clock_time(clock_time_string,recording_start):
     clock_time_string = str(clock_time_string).strip()
@@ -174,7 +167,7 @@ if uploaded_file is not None:
     # LOAD FILE
     try:
         info = extract_recording_metadata(uploaded_file)
-        ekg_data = load_ekg(uploaded_file,info)
+        time_vector,ekg_data = load_ekg(uploaded_file,info)
     except Exception as e:
         st.error(f"Could not read the Delsys file:\n\n{e}")
         st.stop()
@@ -182,9 +175,9 @@ if uploaded_file is not None:
     recording_start = info["recording_start"]
     ekg_fs = info["ekg_fs"]
     collection_length = info["collection_length"]
-
-    time_vector = np.arange(len(ekg_data))/ekg_fs
-    calculated_duration = len(ekg_data)/ekg_fs
+    
+    calculated_duration = time_vector[-1]-time_vector[0]
+    
     recording_end = recording_start+pd.to_timedelta(calculated_duration,unit="s")
 
     # RECORDING INFORMATION
