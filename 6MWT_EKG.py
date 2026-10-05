@@ -10,7 +10,7 @@ The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) lat
 
 @author: beier
 
-Sept 2026 - v1
+Oct 2026 - v2
 """
 
 import csv
@@ -449,3 +449,6 @@ if uploaded_file is not None:
             type="primary",
             key="download_processed_csv"
         )
+
+
+
