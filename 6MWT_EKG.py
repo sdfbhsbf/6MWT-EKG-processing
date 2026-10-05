@@ -10,7 +10,7 @@ The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) lat
 
 @author: beier
 
-Sept 2026 - v1
+Oct 2026 - v2
 """
 
 import csv
@@ -220,6 +220,26 @@ if uploaded_file is not None:
     st.subheader("6MWT start time")
     sixmwt_start_clock = st.text_input("**6MWT start time**",placeholder="Example: 10:51:13 AM")
 
+    #clock time alignment
+    st.subheader("Clock alignment (optional)")
+    
+    clock_offset = st.number_input(
+        "Delsys clock offset (seconds)",
+        value=0.0,
+        step=1.0,
+        help=(
+            "Enter a positive value if the Delsys clock is ahead of the clock "
+            "used to record the 6MWT start time, or a negative value if it is behind. "
+            "For example, if Delsys is 2 minutes ahead, enter 120."
+        )
+    )
+    
+    st.caption(
+        "Leave at 0 if the clocks are synchronized. "
+        "Example: Delsys 2 min ahead = +120 s; Delsys 1 min behind = -60 s."
+    )
+
+
     # OUTPUT TRIMMING
     st.subheader("Output trimming")
 
@@ -233,16 +253,23 @@ if uploaded_file is not None:
 
     # RECONSTRUCT BUTTON
     if st.button("Reconstruct 6MWT Triggers",type="primary",key="reconstruct_button"):
-
+    
         try:
             start_datetime,start_seconds = parse_manual_clock_time(sixmwt_start_clock,recording_start)
         except Exception as e:
             st.error(str(e))
             st.stop()
-
-        end_seconds = start_seconds+360
-        end_datetime = start_datetime+pd.Timedelta(seconds=360)
-
+    
+        # Apply Delsys clock offset
+        adjusted_start_seconds = start_seconds+clock_offset
+        adjusted_start_datetime = start_datetime+pd.Timedelta(seconds=clock_offset)
+    
+        end_seconds = adjusted_start_seconds+360
+        end_datetime = adjusted_start_datetime+pd.Timedelta(seconds=360)
+    
+        # Use adjusted time for processing
+        start_seconds = adjusted_start_seconds
+        
         if start_seconds < 0:
             st.error("The reconstructed 6MWT start occurs before the EKG recording begins.")
             st.stop()
@@ -262,12 +289,9 @@ if uploaded_file is not None:
 
         # TRIGGER INDICES
 
-        start_idx = int(round(start_seconds*ekg_fs))
-        end_idx = int(round(end_seconds*ekg_fs))
-
-        start_idx = int(np.clip(start_idx,0,len(ekg_data)-1))
-        end_idx = int(np.clip(end_idx,0,len(ekg_data)-1))
-
+        start_idx = int(np.argmin(np.abs(time_vector-start_seconds)))
+        end_idx = int(np.argmin(np.abs(time_vector-end_seconds)))
+        
         trigger_indices = np.array([start_idx,end_idx],dtype=int)
         trigger_labels = ["6MWT Start","6MWT End"]
 
@@ -276,9 +300,13 @@ if uploaded_file is not None:
         trigger_info = pd.DataFrame({
             "Trigger Number":[1,2],
             "Trigger Label":["6MWT Start","6MWT End"],
-            "Clock Time":[
+            "Recorded Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
+                (start_datetime+pd.Timedelta(seconds=360)).strftime("%I:%M:%S %p")],
+            "Adjusted Delsys Clock Time":[
+                adjusted_start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
+            "Delsys Clock Offset (s)":[clock_offset,clock_offset],
             "Seconds From Original Recording Start":[start_seconds,end_seconds],
             "Original Sample Index":[start_idx,end_idx]})
 
@@ -338,9 +366,13 @@ if uploaded_file is not None:
 
         trigger_export = pd.DataFrame({
             "Trigger Label":["6MWT Start","6MWT End"],
-            "Recorded / Calculated Clock Time":[
+            "Recorded Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
+                (start_datetime+pd.Timedelta(seconds=360)).strftime("%I:%M:%S %p")],
+            "Adjusted Delsys Clock Time":[
+                adjusted_start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
+            "Delsys Clock Offset (s)":[clock_offset,clock_offset],
             "Seconds From Original Recording Start":[start_seconds,end_seconds],
             "Trigger Onset Times (s)":[
                 output_trigger_times[0],
