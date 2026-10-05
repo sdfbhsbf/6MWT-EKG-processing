@@ -10,7 +10,7 @@ The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) lat
 
 @author: beier
 
-Oct 2026 - v2
+Sept 2026 - v1
 """
 
 import csv
@@ -157,7 +157,6 @@ def make_ekg_plot(ekg_data,time_vector,trigger_indices=None,trigger_labels=None,
     fig.update_layout(title=title,xaxis_title="Time (s)",yaxis_title="EKG Signal (mV)",height=600,hovermode="x unified")
     return fig
 
-
 #FILE UPLOAD
 
 uploaded_file = st.file_uploader("Upload raw overground Delsys CSV",type=["csv"])
@@ -172,12 +171,35 @@ if uploaded_file is not None:
         st.error(f"Could not read the Delsys file:\n\n{e}")
         st.stop()
 
-    recording_start = info["recording_start"]
+    delsys_recording_start = info["recording_start"]
     ekg_fs = info["ekg_fs"]
     collection_length = info["collection_length"]
-    
-    calculated_duration = time_vector[-1]-time_vector[0]
-    
+
+    # Make EKG time relative to first EKG sample
+    time_vector = time_vector-time_vector[0]
+    calculated_duration = time_vector[-1]
+
+    # CLOCK ALIGNMENT
+    st.subheader("Clock alignment (optional)")
+
+    clock_offset = st.number_input(
+        "How many seconds is the Delsys clock ahead (+) or behind (-)?",
+        value=0.0,
+        step=1.0,
+        help=(
+            "Enter a positive value if the Delsys clock is ahead of the clock "
+            "used to record the 6MWT start time, or a negative value if it is behind. "
+            "For example, if Delsys is 2 minutes ahead, enter 120."
+        )
+    )
+
+    st.caption(
+        "Leave at 0 if the clocks are synchronized. "
+        "Example: Delsys 2 min ahead = +120 s; Delsys 1 min behind = -60 s."
+    )
+
+    # Shift the entire Delsys recording clock window
+    recording_start = delsys_recording_start-pd.to_timedelta(clock_offset,unit="s")
     recording_end = recording_start+pd.to_timedelta(calculated_duration,unit="s")
 
     # RECORDING INFORMATION
@@ -186,10 +208,15 @@ if uploaded_file is not None:
 
     c1,c2,c3,c4 = st.columns([1.4,1,1,1])
 
-    c1.metric("Recording start",recording_start.strftime("%Y-%m-%d %I:%M:%S %p"))
-    c2.metric("Recording end",recording_end.strftime("%I:%M:%S %p"))
+    c1.metric("Corrected recording start",recording_start.strftime("%Y-%m-%d %I:%M:%S %p"))
+    c2.metric("Corrected recording end",recording_end.strftime("%I:%M:%S %p"))
     c3.metric("EKG sampling rate",f"{ekg_fs:.4f} Hz")
     c4.metric("Calculated duration",f"{calculated_duration:.3f} s")
+
+    st.caption(
+        f"Original Delsys metadata start: {delsys_recording_start.strftime('%Y-%m-%d %I:%M:%S %p')} | "
+        f"Clock offset: {clock_offset:+.1f} s"
+    )
 
     if not np.isnan(collection_length):
         duration_difference = calculated_duration-collection_length
@@ -220,26 +247,6 @@ if uploaded_file is not None:
     st.subheader("6MWT start time")
     sixmwt_start_clock = st.text_input("**6MWT start time**",placeholder="Example: 10:51:13 AM")
 
-    #clock time alignment
-    st.subheader("Clock alignment (optional)")
-    
-    clock_offset = st.number_input(
-        "Delsys clock offset (seconds)",
-        value=0.0,
-        step=1.0,
-        help=(
-            "Enter a positive value if the Delsys clock is ahead of the clock "
-            "used to record the 6MWT start time, or a negative value if it is behind. "
-            "For example, if Delsys is 2 minutes ahead, enter 120."
-        )
-    )
-    
-    st.caption(
-        "Leave at 0 if the clocks are synchronized. "
-        "Example: Delsys 2 min ahead = +120 s; Delsys 1 min behind = -60 s."
-    )
-
-
     # OUTPUT TRIMMING
     st.subheader("Output trimming")
 
@@ -253,61 +260,54 @@ if uploaded_file is not None:
 
     # RECONSTRUCT BUTTON
     if st.button("Reconstruct 6MWT Triggers",type="primary",key="reconstruct_button"):
-    
+
         try:
             start_datetime,start_seconds = parse_manual_clock_time(sixmwt_start_clock,recording_start)
         except Exception as e:
             st.error(str(e))
             st.stop()
-    
-        # Apply Delsys clock offset
-        adjusted_start_seconds = start_seconds+clock_offset
-        adjusted_start_datetime = start_datetime+pd.Timedelta(seconds=clock_offset)
-    
-        end_seconds = adjusted_start_seconds+360
-        end_datetime = adjusted_start_datetime+pd.Timedelta(seconds=360)
-    
-        # Use adjusted time for processing
-        start_seconds = adjusted_start_seconds
-        
+
+        end_seconds = start_seconds+360
+        end_datetime = start_datetime+pd.Timedelta(seconds=360)
+
         if start_seconds < 0:
-            st.error("The reconstructed 6MWT start occurs before the EKG recording begins.")
+            st.error(
+                f"The 6MWT start occurs {abs(start_seconds):.2f} s before the corrected "
+                f"EKG recording begins. Check the clock offset.")
             st.stop()
 
         if start_seconds > calculated_duration:
             st.error(
-                f"The reconstructed 6MWT start occurs at {start_seconds:.2f} s, "
-                f"but the recording is only {calculated_duration:.2f} s long.")
+                f"The 6MWT start occurs at {start_seconds:.2f} s after the corrected "
+                f"recording start, but the recording is only {calculated_duration:.2f} s long.")
             st.stop()
 
         if end_seconds > calculated_duration:
+            missing_seconds = end_seconds-calculated_duration
             st.error(
-                f"The 6MWT would end at {end_seconds:.2f} s after recording start, "
-                f"but the EKG recording is only {calculated_duration:.2f} s long.\n\n"
-                f"The recording does not contain the full 6-minute walk.")
+                f"6MWT start: {start_datetime.strftime('%I:%M:%S %p')}\n\n"
+                f"6MWT end: {end_datetime.strftime('%I:%M:%S %p')}\n\n"
+                f"Corrected EKG recording end: {recording_end.strftime('%I:%M:%S %p')}\n\n"
+                f"The EKG recording ends {missing_seconds:.2f} s before the 6MWT ends.")
             st.stop()
 
         # TRIGGER INDICES
 
         start_idx = int(np.argmin(np.abs(time_vector-start_seconds)))
         end_idx = int(np.argmin(np.abs(time_vector-end_seconds)))
-        
+
         trigger_indices = np.array([start_idx,end_idx],dtype=int)
         trigger_labels = ["6MWT Start","6MWT End"]
-
 
         # TRIGGER SUMMARY
         trigger_info = pd.DataFrame({
             "Trigger Number":[1,2],
             "Trigger Label":["6MWT Start","6MWT End"],
-            "Recorded Clock Time":[
+            "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
-                (start_datetime+pd.Timedelta(seconds=360)).strftime("%I:%M:%S %p")],
-            "Adjusted Delsys Clock Time":[
-                adjusted_start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
             "Delsys Clock Offset (s)":[clock_offset,clock_offset],
-            "Seconds From Original Recording Start":[start_seconds,end_seconds],
+            "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
             "Original Sample Index":[start_idx,end_idx]})
 
         st.subheader("Reconstructed 6MWT triggers")
@@ -333,12 +333,12 @@ if uploaded_file is not None:
 
         elif trim_choice == "Start recording at 6MWT start":
             ekg_output = ekg_data[start_idx:]
-            output_time = np.arange(len(ekg_output))/ekg_fs
+            output_time = time_vector[start_idx:]-time_vector[start_idx]
             output_trigger_indices = np.array([0,end_idx-start_idx],dtype=int)
 
         else:
             ekg_output = ekg_data[start_idx:end_idx+1]
-            output_time = np.arange(len(ekg_output))/ekg_fs
+            output_time = time_vector[start_idx:end_idx+1]-time_vector[start_idx]
             output_trigger_indices = np.array([0,len(ekg_output)-1],dtype=int)
 
         # BINARY TRIGGER
@@ -355,7 +355,6 @@ if uploaded_file is not None:
 
         st.plotly_chart(final_fig,use_container_width=True)
 
-
         # EXPORT DATA
         output_trigger_times = output_time[output_trigger_indices]
 
@@ -366,14 +365,17 @@ if uploaded_file is not None:
 
         trigger_export = pd.DataFrame({
             "Trigger Label":["6MWT Start","6MWT End"],
-            "Recorded Clock Time":[
+            "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
-                (start_datetime+pd.Timedelta(seconds=360)).strftime("%I:%M:%S %p")],
-            "Adjusted Delsys Clock Time":[
-                adjusted_start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
+            "Original Delsys Recording Start":[
+                delsys_recording_start.strftime("%I:%M:%S %p"),
+                delsys_recording_start.strftime("%I:%M:%S %p")],
+            "Corrected EKG Recording Start":[
+                recording_start.strftime("%I:%M:%S %p"),
+                recording_start.strftime("%I:%M:%S %p")],
             "Delsys Clock Offset (s)":[clock_offset,clock_offset],
-            "Seconds From Original Recording Start":[start_seconds,end_seconds],
+            "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
             "Trigger Onset Times (s)":[
                 output_trigger_times[0],
                 output_trigger_times[1]]})
@@ -394,7 +396,6 @@ if uploaded_file is not None:
 
         st.success("✅ 6MWT triggers reconstructed successfully.")
 
-
     # OUTPUT PREVIEW
     if (st.session_state.export_data is not None
         and st.session_state.processed_source == uploaded_file.name):
@@ -402,7 +403,6 @@ if uploaded_file is not None:
         st.dataframe(
             st.session_state.export_data.head(100),
             use_container_width=True)
-
 
         # # SAVE PROCESSED DATA
         # st.divider()
@@ -432,16 +432,15 @@ if uploaded_file is not None:
 
         #     except Exception as e:
         #         st.error(f"Could not save file:\n\n{e}")
-          
-        
+
         # DOWNLOAD PROCESSED DATA
         st.divider()
         st.subheader("Export processed data")
-        
+
         csv_data = st.session_state.export_data.to_csv(index=False).encode("utf-8")
-        
+
         st.write(f"**File name:** `{st.session_state.output_filename}`")
-        
+
         st.download_button(
             label="💾 Download processed CSV",
             data=csv_data,
@@ -449,7 +448,4 @@ if uploaded_file is not None:
             mime="text/csv",
             type="primary",
             key="download_processed_csv"
-        )          
-                    
-                    
-                    
+        )
