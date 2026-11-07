@@ -240,25 +240,33 @@ def summarize_walk_hr(time, peaks):
     return beat_hr, epochs
 
 
-def show_walk_hr(export_data, fs, source, output_filename):
+def peak_near_time(time, clean, target, lo, hi):
+    first = max(lo, min(hi - 1, int(time.searchsorted(target - 0.03))))
+    last = max(first + 1, min(hi, int(time.searchsorted(target + 0.03, side="right"))))
+    return first + int(np.argmax(clean[first:last]))
+
+
+def show_walk_hr(walk, fs, source, output_filename):
     st.divider()
     st.subheader("6MWT R-peak review and heart rate")
-    st.write("Detect R-peaks in the marked six-minute walk, then review the peaks by 15-second epoch.")
+    if walk is None:
+        st.info("Process the walk above to prepare the trimmed EKG for R-peak detection.")
+        return
+
+    time = walk["time"]
+    st.write("Detect R-peaks in the trimmed EKG, then review the peaks by 15-second epoch.")
+    st.caption(f"Analysis input: {len(time):,} trimmed EKG samples spanning {time[-1]:.3f} s from the selected start.")
     invert_signal = st.checkbox("Invert EKG polarity for R-peak detection")
     analysis_key = (source, invert_signal)
     if st.button("Detect R-peaks"):
         st.session_state.pop("walk_hr_review", None)
-        markers = np.flatnonzero(export_data["Binary Trigger"].to_numpy())
-        if len(markers) != 2 or not np.isfinite(fs) or fs <= 0:
-            st.error("Heart-rate analysis needs two distinct walk markers and a valid EKG sampling rate.")
+        if not np.isfinite(fs) or fs <= 0:
+            st.error("Heart-rate analysis needs a valid EKG sampling rate.")
             return
 
-        start, end = markers
-        walk = export_data.iloc[start:end + 1]
-        time = walk["Time (s)"].to_numpy() - walk["Time (s)"].iloc[0]
         try:
-            with st.spinner("Detecting R-peaks in the six-minute walk..."):
-                clean, detected, auto = detect_r_peaks(walk["EKG Signal"].to_numpy(), fs, invert_signal)
+            with st.spinner("Detecting R-peaks in the trimmed EKG..."):
+                clean, detected, auto = detect_r_peaks(walk["signal"], fs, invert_signal)
         except ModuleNotFoundError as exc:
             if exc.name != "neurokit2":
                 raise
@@ -270,12 +278,10 @@ def show_walk_hr(export_data, fs, source, output_filename):
 
         st.session_state.walk_hr_review = {
             "key": analysis_key,
-            "time": time,
             "clean": clean,
             "detected": detected[time[detected] < TEST_DURATION_SECONDS],
             "auto": auto[time[auto] < TEST_DURATION_SECONDS],
             "peaks": auto[time[auto] < TEST_DURATION_SECONDS],
-            "export_start": start,
             "history": [],
         }
 
@@ -283,7 +289,7 @@ def show_walk_hr(export_data, fs, source, output_filename):
     if review is None or review["key"] != analysis_key:
         return
 
-    time, clean, peaks = review["time"], review["clean"], review["peaks"]
+    clean, peaks = review["clean"], review["peaks"]
     if not review["auto"].size:
         st.warning("No automatic R-peaks passed the filters. Try inverting the signal or add peaks during review.")
 
@@ -309,9 +315,7 @@ def show_walk_hr(export_data, fs, source, output_filename):
             value=(left + right) / 2, step=0.001, format="%.3f", key=f"add_r_peak_time_{epoch}",
         )
         if add_col.button("Add peak"):
-            first = max(lo, min(hi - 1, int(time.searchsorted(add_at - 0.03))))
-            last = max(first + 1, min(hi, int(time.searchsorted(add_at + 0.03, side="right"))))
-            sample = first + int(np.argmax(clean[first:last]))
+            sample = peak_near_time(time, clean, add_at, lo, hi)
             if sample not in peaks:
                 review["history"].append(peaks)
                 peaks = np.union1d(peaks, [sample])
@@ -319,21 +323,51 @@ def show_walk_hr(export_data, fs, source, output_filename):
         peaks = review["history"].pop()
     review["peaks"] = peaks
 
-    fig = make_ekg_plot(clean[lo:hi], time[lo:hi], title=f"Cleaned EKG · Epoch {epoch}")
+    chart_key = f"walk_r_peak_chart_{epoch}"
+
+    def edit_clicked_peak():
+        points = st.session_state[chart_key]["selection"]["points"]
+        if len(points) != 1:
+            return
+
+        point = points[0]
+        current = review["peaks"]
+        sample = point.get("customdata")
+        if sample is None:
+            sample = peak_near_time(time, clean, float(point["x"]), lo, hi)
+            if sample in current:
+                return
+
+        review["history"].append(current)
+        review["peaks"] = (
+            current[current != sample] if sample in current else np.union1d(current, [sample])
+        )
+
+    st.caption(
+        "Click a diamond or star to remove that peak. Click the EKG trace near a missed peak to add it, "
+        "or click a gray × to restore it. Use Undo last peak edit to reverse a change."
+    )
+    # Markers make the waveform samples selectable. WebGL keeps dense epochs responsive.
+    fig = go.Figure(go.Scattergl(
+        x=time[lo:hi], y=clean[lo:hi], name="EKG", mode="lines+markers",
+        line=dict(width=1), marker=dict(size=3, opacity=0.2),
+    ))
     for label, indices, color, symbol in (
         ("Kept automatic peaks", np.intersect1d(peaks, review["auto"]), "#E8790C", "diamond"),
         ("Removed peaks", np.setdiff1d(review["detected"], peaks), "#737373", "x"),
         ("Manually added peaks", np.setdiff1d(peaks, review["auto"]), "#1677BB", "star"),
     ):
         visible = indices[(indices >= lo) & (indices < hi)]
-        fig.add_scatter(x=time[visible], y=clean[visible], mode="markers", name=label,
+        fig.add_scatter(x=time[visible], y=clean[visible], customdata=visible.tolist(), mode="markers", name=label,
                         marker=dict(size=9, color=color, symbol=symbol))
     fig.update_xaxes(range=[left, right], title="Time since walk start (s)")
-    fig.update_layout(height=425)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(title=f"Cleaned EKG · Epoch {epoch}", yaxis_title="EKG Signal (mV)",
+                      height=425, clickmode="event+select", hovermode="closest")
+    st.plotly_chart(fig, use_container_width=True, key=chart_key,
+                    on_select=edit_clicked_peak, selection_mode="points")
 
     beat_hr, epochs = summarize_walk_hr(time, peaks)
-    beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + review["export_start"])
+    beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + walk["export_start"])
     st.subheader("Heart rate by 15-second epoch")
     st.caption(
         "Epochs start at the walk marker. Each average uses unsmoothed HR values from 40–180 bpm, "
@@ -351,7 +385,7 @@ def show_walk_hr(export_data, fs, source, output_filename):
 
     peak_export = pd.DataFrame({
         "walk_sample_idx": peaks,
-        "export_sample_idx": peaks + review["export_start"],
+        "export_sample_idx": peaks + walk["export_start"],
         "time_s": time[peaks],
         "amplitude_mV": clean[peaks],
         "source": np.where(np.isin(peaks, review["auto"]), "automatic", "manual"),
@@ -578,6 +612,9 @@ if uploaded_file is not None:
 
         start_idx = int(np.argmin(np.abs(time_vector-start_seconds)))
         end_idx = int(np.argmin(np.abs(time_vector-end_seconds)))
+        if end_idx <= start_idx:
+            st.error("The selected walk start and end must match two distinct EKG samples.")
+            st.stop()
 
         trigger_indices = np.array([start_idx,end_idx],dtype=int)
         trigger_labels = ["6MWT Start","6MWT End"]
@@ -608,6 +645,9 @@ if uploaded_file is not None:
         st.plotly_chart(trigger_fig,use_container_width=True)
 
         # TRIM DATA
+        walk_slice = slice(start_idx,end_idx+1)
+        walk_signal = ekg_data[walk_slice]
+        walk_time = time_vector[walk_slice]-time_vector[start_idx]
 
         if trim_choice == "Keep full recording":
             ekg_output = ekg_data.copy()
@@ -620,8 +660,8 @@ if uploaded_file is not None:
             output_trigger_indices = np.array([0,end_idx-start_idx],dtype=int)
 
         else:
-            ekg_output = ekg_data[start_idx:end_idx+1]
-            output_time = time_vector[start_idx:end_idx+1]-time_vector[start_idx]
+            ekg_output = walk_signal
+            output_time = walk_time
             output_trigger_indices = np.array([0,len(ekg_output)-1],dtype=int)
 
         # BINARY TRIGGER
@@ -675,8 +715,14 @@ if uploaded_file is not None:
 
         st.session_state.export_data = export_data
         st.session_state.processed_csv = export_data.to_csv(index=False).encode("utf-8")
+        st.session_state.processed_walk = {
+            "signal": walk_signal,
+            "time": walk_time,
+            "export_start": output_trigger_indices[0],
+        }
         st.session_state.output_filename = output_filename
         st.session_state.processed_source = source
+        st.session_state.pop("walk_hr_review", None)
 
         st.success("✅ 6MWT EKG processed successfully.")
 
@@ -732,4 +778,4 @@ if uploaded_file is not None:
             key="download_processed_csv"
         )
 
-        show_walk_hr(st.session_state.export_data, ekg_fs, source, st.session_state.output_filename)
+        show_walk_hr(st.session_state.get("processed_walk"), ekg_fs, source, st.session_state.output_filename)
