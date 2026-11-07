@@ -469,7 +469,7 @@ if uploaded_file is not None:
             "Trigger Label":["6MWT Start","6MWT End"],
             "Trigger Onset Times (s)":[
                 output_trigger_times[0],
-                output_trigger_times[1]]",
+                output_trigger_times[1]],
             "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
