@@ -171,20 +171,15 @@ def parse_manual_clock_time(clock_time_string,recording_start):
     seconds_from_start = (event_datetime-recording_start).total_seconds()
     return event_datetime,seconds_from_start
 
-def make_ekg_plot(ekg_data,time_vector,trigger_indices=None,trigger_labels=None,title="EKG Signal"):
+def make_ekg_plot(ekg_data,time_vector,trigger_times=(),trigger_labels=None,title="EKG Signal"):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=time_vector,y=ekg_data,mode="lines",name="EKG",line=dict(width=1)))
 
-    if trigger_indices is not None:
-        for i,idx in enumerate(trigger_indices):
-            if idx < 0 or idx >= len(time_vector):
-                continue
+    for i,trigger_time in enumerate(trigger_times):
+        fig.add_vline(x=trigger_time,line_width=2,line_dash="dash")
 
-            trigger_time = time_vector[idx]
-            fig.add_vline(x=trigger_time,line_width=2,line_dash="dash")
-
-            if trigger_labels is not None:
-                fig.add_annotation(x=trigger_time,y=1,yref="paper",text=trigger_labels[i],showarrow=False,textangle=-90,xanchor="left",yanchor="top")
+        if trigger_labels is not None:
+            fig.add_annotation(x=trigger_time,y=1,yref="paper",text=trigger_labels[i],showarrow=False,textangle=-90,xanchor="left",yanchor="top")
 
     fig.update_layout(title=title,xaxis_title="Time (s)",yaxis_title="EKG Signal (mV)",height=600,hovermode="x unified")
     return fig
@@ -275,23 +270,11 @@ if uploaded_file is not None:
                 "Calculated EKG duration differs from the Delsys Collection Length "
                 "by more than 1 second.")
 
-    # RAW EKG
-    with st.expander("Preview raw EKG"):
-        raw_fig = make_ekg_plot(ekg_data=ekg_data,time_vector=time_vector,title="Raw Overground EKG")
-        st.plotly_chart(raw_fig,use_container_width=True)
-
-    # 6MWT INPUT
-    st.subheader("6MWT timing")
-
-    selected_trigger = None
+    # DETECT ANALOG TRIGGERS FOR THE PREVIEW AND PICKER
+    analog_markers = {}
     threshold_v = None
-    sixmwt_start_clock = None
     if use_analog_trigger:
         st.subheader("Recorded Analog 1 triggers")
-        st.write(
-            "Choose the trigger that marks the start of this walk. "
-            "The app sets the end marker 360 seconds later."
-        )
         threshold_v = st.number_input(
             "Analog 1 falling-edge threshold (V)",
             value=DEFAULT_ANALOG_THRESHOLD_V,
@@ -302,13 +285,41 @@ if uploaded_file is not None:
             analog_times = find_analog_trigger_times(uploaded_file,info,threshold_v)
         except (ValueError,pd.errors.ParserError) as e:
             st.error(f"Could not detect Analog 1 triggers. {e}")
-            st.stop()
+        else:
+            analog_markers = {
+                f"Trigger {i}": float(seconds)
+                for i,seconds in enumerate(analog_times-ekg_time_origin,start=1)
+            }
+            if not analog_markers:
+                st.warning("No Analog 1 falling edges were detected at this threshold.")
 
-        trigger_seconds = analog_times-ekg_time_origin
-        if trigger_seconds.size:
+    # RAW EKG
+    with st.expander("Preview raw EKG",expanded=use_analog_trigger):
+        if analog_markers:
+            st.caption("The numbered Analog 1 markers match the start-trigger choices below.")
+        raw_fig = make_ekg_plot(
+            ekg_data=ekg_data,
+            time_vector=time_vector,
+            trigger_times=analog_markers.values(),
+            trigger_labels=list(analog_markers),
+            title="Raw Overground EKG",
+        )
+        st.plotly_chart(raw_fig,use_container_width=True)
+
+    # 6MWT INPUT
+    st.subheader("6MWT timing")
+
+    selected_trigger = None
+    sixmwt_start_clock = None
+    if use_analog_trigger:
+        st.write(
+            "Choose the trigger that marks the start of this walk. "
+            "The app sets the end marker 360 seconds later."
+        )
+        if analog_markers:
             trigger_options = {
-                f"Trigger {i} at {seconds:.4f} s from EKG start": float(seconds)
-                for i,seconds in enumerate(trigger_seconds,start=1)
+                f"{label} at {seconds:.4f} s from EKG start": seconds
+                for label,seconds in analog_markers.items()
             }
             selection = st.selectbox(
                 "6MWT start trigger",
@@ -319,8 +330,6 @@ if uploaded_file is not None:
             )
             if selection is not None:
                 selected_trigger = trigger_options[selection]
-        else:
-            st.warning("No Analog 1 falling edges were detected at this threshold.")
     else:
         st.write(
             "Enter the manually recorded clock time when the **6-minute walk test started**. "
@@ -411,7 +420,7 @@ if uploaded_file is not None:
         trigger_fig = make_ekg_plot(
             ekg_data=ekg_data,
             time_vector=time_vector,
-            trigger_indices=trigger_indices,
+            trigger_times=time_vector[trigger_indices],
             trigger_labels=trigger_labels,
             title="EKG with 6MWT Start and End")
 
@@ -442,7 +451,7 @@ if uploaded_file is not None:
         final_fig = make_ekg_plot(
             ekg_data=ekg_output,
             time_vector=output_time,
-            trigger_indices=output_trigger_indices,
+            trigger_times=output_time[output_trigger_indices],
             trigger_labels=trigger_labels,
             title="Processed 6MWT EKG")
 
