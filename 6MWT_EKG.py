@@ -383,10 +383,42 @@ def show_walk_hr(walk, fs, source, output_filename):
 
     beat_hr, epochs = summarize_walk_hr(time, peaks)
     beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + walk["export_start"])
+
+    st.subheader("Participant HR intensity cutoffs")
+    st.caption(
+        "Enter the minimum BPM for each zone. A value exactly at a cutoff enters that zone. "
+        "Values below the light cutoff are labeled “Below light.”"
+    )
+    cutoffs = [
+        column.number_input(
+            f"{zone} cutoff (bpm)", min_value=0.0, value=None, step=1.0,
+            key=f"hr_cutoff_{zone}_{source[0]}_{source[1]}",
+        )
+        for column, zone in zip(st.columns(3), ("Light", "Moderate", "Vigorous"))
+    ]
+    valid_cutoffs = False
+    if all(cutoff is not None for cutoff in cutoffs):
+        valid_cutoffs = np.isfinite(cutoffs).all() and cutoffs[0] < cutoffs[1] < cutoffs[2]
+        if not valid_cutoffs:
+            st.error("Enter increasing cutoffs in order from light to moderate to vigorous.")
+
+    for table, hr_column in ((beat_hr, "hr_bpm"), (epochs, "mean_hr_bpm")):
+        table["intensity_zone"] = (
+            pd.cut(
+                table[hr_column], [-np.inf, *cutoffs, np.inf],
+                labels=["Below light", "Light", "Moderate", "Vigorous"], right=False,
+            )
+            if valid_cutoffs else pd.NA
+        )
+
     st.subheader("Heart rate by 15-second epoch")
     st.caption(
         "Epochs start at the walk marker. Each average uses unsmoothed HR values from 40–180 bpm, "
         "assigned by the time of the later R-peak. An epoch with no valid intervals has a blank mean."
+    )
+    st.caption(
+        "Zones use unsmoothed BPM for each beat and mean BPM for each epoch. "
+        "Zone labels are blank until all three cutoffs are valid."
     )
     st.dataframe(epochs, hide_index=True, use_container_width=True)
 
