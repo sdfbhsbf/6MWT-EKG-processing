@@ -467,6 +467,9 @@ if uploaded_file is not None:
 
         trigger_export = pd.DataFrame({
             "Trigger Label":["6MWT Start","6MWT End"],
+            "Trigger Onset Times (s)":[
+                output_trigger_times[0],
+                output_trigger_times[1]]",
             "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
@@ -477,10 +480,8 @@ if uploaded_file is not None:
                 recording_start.strftime("%I:%M:%S %p"),
                 recording_start.strftime("%I:%M:%S %p")],
             "Delsys Clock Offset (s)":[clock_offset,clock_offset],
-            "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
-            "Trigger Onset Times (s)":[
-                output_trigger_times[0],
-                output_trigger_times[1]]})
+            "Seconds From Corrected Recording Start":[start_seconds,end_seconds]
+})
 
         export_data = pd.concat([export_data,trigger_export],axis=1)
 
