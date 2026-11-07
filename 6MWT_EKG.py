@@ -22,6 +22,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 TEST_DURATION_SECONDS = 360
+HR_EPOCH_SECONDS = 15
 DEFAULT_ANALOG_THRESHOLD_V = 2.5
 
 # #change save folder
@@ -183,6 +184,186 @@ def make_ekg_plot(ekg_data,time_vector,trigger_times=(),trigger_labels=None,titl
 
     fig.update_layout(title=title,xaxis_title="Time (s)",yaxis_title="EKG Signal (mV)",height=600,hovermode="x unified")
     return fig
+
+def detect_r_peaks(signal,fs,invert_signal):
+    import neurokit2 as nk
+
+    clean = nk.ecg_clean(signal, sampling_rate=fs, method="neurokit")
+    if invert_signal:
+        clean = -clean
+    _, info = nk.ecg_peaks(clean, sampling_rate=fs, method="neurokit")
+    detected = info["ECG_R_Peaks"]
+    if len(detected) >= 3:
+        _, detected = nk.signal_fixpeaks(detected, sampling_rate=fs, method="Kubios")
+    detected = np.unique(np.asarray(detected, dtype=int))
+    detected = detected[(detected >= 0) & (detected < len(clean))]
+
+    # Match the reference dashboard's positive amplitude and spacing filters.
+    candidates = detected[clean[detected] > 0]
+    if candidates.size:
+        candidates = candidates[clean[candidates] >= 0.20 * np.median(clean[candidates])]
+
+    kept = []
+    min_spacing = int(0.30 * fs)
+    for sample in candidates:
+        if not kept or sample - kept[-1] >= min_spacing:
+            kept.append(sample)
+        elif clean[sample] > clean[kept[-1]]:
+            kept[-1] = sample
+    return clean, detected, np.array(kept, dtype=int)
+
+
+def summarize_walk_hr(time, peaks):
+    epoch_starts = np.arange(0, TEST_DURATION_SECONDS, HR_EPOCH_SECONDS)
+    peaks = peaks[(time[peaks] >= 0) & (time[peaks] < TEST_DURATION_SECONDS)]
+    peak_times = time[peaks]
+    rr = np.diff(peak_times)
+    bpm = np.divide(60, rr, out=np.full(rr.shape, np.nan), where=rr > 0)
+    valid = (bpm >= 40) & (bpm <= 180)
+    beat_hr = pd.DataFrame({
+        "walk_sample_idx": peaks[1:][valid],
+        "time_s": peak_times[1:][valid],
+        "rr_s": rr[valid],
+        "hr_bpm": bpm[valid],
+    })
+    beat_hr["hr_smooth_bpm"] = beat_hr["hr_bpm"].rolling(5, center=True, min_periods=1).mean()
+    epochs = pd.DataFrame({
+        "epoch": np.arange(1, len(epoch_starts) + 1),
+        "start_s": epoch_starts,
+        "end_s": epoch_starts + HR_EPOCH_SECONDS,
+        "r_peak_count": np.histogram(peak_times, bins=np.r_[epoch_starts, TEST_DURATION_SECONDS])[0],
+    })
+    # Assign each valid interval to the epoch containing its later R-peak.
+    grouped = beat_hr.groupby(beat_hr["time_s"] // HR_EPOCH_SECONDS)["hr_bpm"]
+    epochs["valid_rr_count"] = grouped.count().reindex(epochs.index, fill_value=0)
+    epochs["mean_hr_bpm"] = grouped.mean().reindex(epochs.index)
+    return beat_hr, epochs
+
+
+def show_walk_hr(export_data, fs, source, output_filename):
+    st.divider()
+    st.subheader("6MWT R-peak review and heart rate")
+    st.write("Detect R-peaks in the marked six-minute walk, then review the peaks by 15-second epoch.")
+    invert_signal = st.checkbox("Invert EKG polarity for R-peak detection")
+    analysis_key = (source, invert_signal)
+    if st.button("Detect R-peaks"):
+        st.session_state.pop("walk_hr_review", None)
+        markers = np.flatnonzero(export_data["Binary Trigger"].to_numpy())
+        if len(markers) != 2 or not np.isfinite(fs) or fs <= 0:
+            st.error("Heart-rate analysis needs two distinct walk markers and a valid EKG sampling rate.")
+            return
+
+        start, end = markers
+        walk = export_data.iloc[start:end + 1]
+        time = walk["Time (s)"].to_numpy() - walk["Time (s)"].iloc[0]
+        try:
+            with st.spinner("Detecting R-peaks in the six-minute walk..."):
+                clean, detected, auto = detect_r_peaks(walk["EKG Signal"].to_numpy(), fs, invert_signal)
+        except ModuleNotFoundError as exc:
+            if exc.name != "neurokit2":
+                raise
+            st.error("Install NeuroKit2 in the environment running Streamlit with `python -m pip install neurokit2`.")
+            return
+        except (ValueError, IndexError) as exc:
+            st.error(f"Could not detect R-peaks in this walk. {exc}")
+            return
+
+        st.session_state.walk_hr_review = {
+            "key": analysis_key,
+            "time": time,
+            "clean": clean,
+            "detected": detected[time[detected] < TEST_DURATION_SECONDS],
+            "auto": auto[time[auto] < TEST_DURATION_SECONDS],
+            "peaks": auto[time[auto] < TEST_DURATION_SECONDS],
+            "export_start": start,
+            "history": [],
+        }
+
+    review = st.session_state.get("walk_hr_review")
+    if review is None or review["key"] != analysis_key:
+        return
+
+    time, clean, peaks = review["time"], review["clean"], review["peaks"]
+    if not review["auto"].size:
+        st.warning("No automatic R-peaks passed the filters. Try inverting the signal or add peaks during review.")
+
+    epoch = st.selectbox(
+        "Review epoch",
+        range(1, TEST_DURATION_SECONDS // HR_EPOCH_SECONDS + 1),
+        format_func=lambda n: f"Epoch {n} ({(n - 1) * HR_EPOCH_SECONDS}–{n * HR_EPOCH_SECONDS} s)",
+    )
+    left, right = (epoch - 1) * HR_EPOCH_SECONDS, epoch * HR_EPOCH_SECONDS
+    lo, hi = time.searchsorted([left, right])
+    visible_peaks = peaks[(peaks >= lo) & (peaks < hi)]
+    remove_col, add_col, undo_col = st.columns(3)
+    if visible_peaks.size:
+        peak_choices = {f"{time[i]:.4f} s (sample {i})": i for i in visible_peaks}
+        chosen = remove_col.selectbox("Peak to remove", list(peak_choices), index=None)
+        if remove_col.button("Remove peak", disabled=chosen is None):
+            review["history"].append(peaks)
+            peaks = peaks[peaks != peak_choices[chosen]]
+
+    if hi > lo:
+        add_at = add_col.number_input(
+            "Add peak near walk time (s)", min_value=float(left), max_value=float(right),
+            value=(left + right) / 2, step=0.001, format="%.3f", key=f"add_r_peak_time_{epoch}",
+        )
+        if add_col.button("Add peak"):
+            first = max(lo, min(hi - 1, int(time.searchsorted(add_at - 0.03))))
+            last = max(first + 1, min(hi, int(time.searchsorted(add_at + 0.03, side="right"))))
+            sample = first + int(np.argmax(clean[first:last]))
+            if sample not in peaks:
+                review["history"].append(peaks)
+                peaks = np.union1d(peaks, [sample])
+    if undo_col.button("Undo last peak edit", disabled=not review["history"]):
+        peaks = review["history"].pop()
+    review["peaks"] = peaks
+
+    fig = make_ekg_plot(clean[lo:hi], time[lo:hi], title=f"Cleaned EKG · Epoch {epoch}")
+    for label, indices, color, symbol in (
+        ("Kept automatic peaks", np.intersect1d(peaks, review["auto"]), "#E8790C", "diamond"),
+        ("Removed peaks", np.setdiff1d(review["detected"], peaks), "#737373", "x"),
+        ("Manually added peaks", np.setdiff1d(peaks, review["auto"]), "#1677BB", "star"),
+    ):
+        visible = indices[(indices >= lo) & (indices < hi)]
+        fig.add_scatter(x=time[visible], y=clean[visible], mode="markers", name=label,
+                        marker=dict(size=9, color=color, symbol=symbol))
+    fig.update_xaxes(range=[left, right], title="Time since walk start (s)")
+    fig.update_layout(height=425)
+    st.plotly_chart(fig, use_container_width=True)
+
+    beat_hr, epochs = summarize_walk_hr(time, peaks)
+    beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + review["export_start"])
+    st.subheader("Heart rate by 15-second epoch")
+    st.caption(
+        "Epochs start at the walk marker. Each average uses unsmoothed HR values from 40–180 bpm, "
+        "assigned by the time of the later R-peak. An epoch with no valid intervals has a blank mean."
+    )
+    st.dataframe(epochs, hide_index=True, use_container_width=True)
+
+    hr_fig = go.Figure()
+    hr_fig.add_scatter(x=beat_hr["time_s"], y=beat_hr["hr_bpm"], mode="markers", name="Beat-to-beat HR")
+    hr_fig.add_scatter(x=beat_hr["time_s"], y=beat_hr["hr_smooth_bpm"], mode="lines", name="5-beat average")
+    hr_fig.add_scatter(x=(epochs["start_s"] + epochs["end_s"]) / 2, y=epochs["mean_hr_bpm"],
+                       mode="markers", name="15-second mean", marker=dict(size=9, symbol="diamond"))
+    hr_fig.update_layout(xaxis_title="Time since walk start (s)", yaxis_title="Heart rate (bpm)", height=400)
+    st.plotly_chart(hr_fig, use_container_width=True)
+
+    peak_export = pd.DataFrame({
+        "walk_sample_idx": peaks,
+        "export_sample_idx": peaks + review["export_start"],
+        "time_s": time[peaks],
+        "amplitude_mV": clean[peaks],
+        "source": np.where(np.isin(peaks, review["auto"]), "automatic", "manual"),
+    })
+    stem = output_filename.removesuffix("_trigger_fixed.csv")
+    for column, (label, table, suffix) in zip(st.columns(3), (
+        ("Download R-peaks CSV", peak_export, "R_peaks"),
+        ("Download beat-to-beat HR CSV", beat_hr, "HR_beat_to_beat"),
+        ("Download 15-second HR CSV", epochs, "HR_15s"),
+    )):
+        column.download_button(label, table.to_csv(index=False), f"{stem}_{suffix}.csv", mime="text/csv")
+
 
 #FILE UPLOAD
 
@@ -467,9 +648,6 @@ if uploaded_file is not None:
 
         trigger_export = pd.DataFrame({
             "Trigger Label":["6MWT Start","6MWT End"],
-            "Trigger Onset Times (s)":[
-                output_trigger_times[0],
-                output_trigger_times[1]],
             "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
@@ -480,8 +658,10 @@ if uploaded_file is not None:
                 recording_start.strftime("%I:%M:%S %p"),
                 recording_start.strftime("%I:%M:%S %p")],
             "Delsys Clock Offset (s)":[clock_offset,clock_offset],
-            "Seconds From Corrected Recording Start":[start_seconds,end_seconds]
-})
+            "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
+            "Trigger Onset Times (s)":[
+                output_trigger_times[0],
+                output_trigger_times[1]]})
 
         export_data = pd.concat([export_data,trigger_export],axis=1)
 
@@ -494,6 +674,7 @@ if uploaded_file is not None:
         output_filename = f"{original_name}_6MWT_trigger_fixed.csv"
 
         st.session_state.export_data = export_data
+        st.session_state.processed_csv = export_data.to_csv(index=False).encode("utf-8")
         st.session_state.output_filename = output_filename
         st.session_state.processed_source = source
 
@@ -540,17 +721,15 @@ if uploaded_file is not None:
         st.divider()
         st.subheader("Export processed data")
 
-        csv_data = st.session_state.export_data.to_csv(index=False).encode("utf-8")
-
         st.write(f"**File name:** `{st.session_state.output_filename}`")
 
         st.download_button(
             label="💾 Download processed CSV",
-            data=csv_data,
+            data=st.session_state.processed_csv,
             file_name=st.session_state.output_filename,
             mime="text/csv",
             type="primary",
             key="download_processed_csv"
         )
 
-
+        show_walk_hr(st.session_state.export_data, ekg_fs, source, st.session_state.output_filename)
