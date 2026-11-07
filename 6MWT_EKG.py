@@ -193,51 +193,87 @@ def detect_r_peaks(signal,fs,invert_signal):
     if invert_signal:
         clean = -clean
     _, info = nk.ecg_peaks(clean, sampling_rate=fs, method="neurokit")
-    detected = info["ECG_R_Peaks"]
-    if len(detected) >= 3:
-        _, detected = nk.signal_fixpeaks(detected, sampling_rate=fs, method="Kubios")
-    detected = np.unique(np.asarray(detected, dtype=int))
+    detected = np.unique(np.asarray(info["ECG_R_Peaks"], dtype=int))
     detected = detected[(detected >= 0) & (detected < len(clean))]
+    suggested = detected
+    if len(detected) >= 3:
+        try:
+            _, suggested = nk.signal_fixpeaks(detected.copy(), sampling_rate=fs, method="Kubios")
+        except (ValueError, IndexError, ZeroDivisionError):
+            suggested = None
 
-    # Match the reference dashboard's positive amplitude and spacing filters.
-    candidates = detected[clean[detected] > 0]
-    if candidates.size:
-        candidates = candidates[clean[candidates] >= 0.20 * np.median(clean[candidates])]
-
-    kept = []
-    min_spacing = int(0.30 * fs)
-    for sample in candidates:
-        if not kept or sample - kept[-1] >= min_spacing:
-            kept.append(sample)
-        elif clean[sample] > clean[kept[-1]]:
-            kept[-1] = sample
-    return clean, detected, np.array(kept, dtype=int)
+    return clean, detected, suggested
 
 
-def summarize_walk_hr(time, peaks):
+def merge_exclusions(ranges):
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(end, merged[-1][1])
+        else:
+            merged.append([start, end])
+    return np.asarray(merged, dtype=float).reshape(-1, 2)
+
+
+def overlaps_exclusion(start, end, exclusions):
+    # Ranges are half-open. A peak at an exclusion's start is unusable.
+    index = np.searchsorted(exclusions[:, 1], start, side="right")
+    return np.r_[exclusions[:, 0], np.inf][index] <= end
+
+
+def summarize_walk_hr(time, peaks, exclusions=(), min_coverage=None):
+    exclusions = merge_exclusions(exclusions)
     epoch_starts = np.arange(0, TEST_DURATION_SECONDS, HR_EPOCH_SECONDS)
+    epoch_ends = epoch_starts + HR_EPOCH_SECONDS
     peaks = peaks[(time[peaks] >= 0) & (time[peaks] < TEST_DURATION_SECONDS)]
     peak_times = time[peaks]
     rr = np.diff(peak_times)
     bpm = np.divide(60, rr, out=np.full(rr.shape, np.nan), where=rr > 0)
-    valid = (bpm >= 40) & (bpm <= 180)
+    crosses_exclusion = overlaps_exclusion(peak_times[:-1], peak_times[1:], exclusions)
+    valid = (rr > 0) & ~crosses_exclusion
+    review_range = valid & ((bpm < 40) | (bpm > 180))
     beat_hr = pd.DataFrame({
-        "walk_sample_idx": peaks[1:][valid],
-        "time_s": peak_times[1:][valid],
-        "rr_s": rr[valid],
-        "hr_bpm": bpm[valid],
+        "walk_sample_idx": peaks[1:],
+        "time_s": peak_times[1:],
+        "rr_s": rr,
+        "hr_bpm": np.where(valid, bpm, np.nan),
+        "rr_status": np.select(
+            [crosses_exclusion, rr <= 0, review_range],
+            ["Excluded: unusable signal", "Excluded: nonpositive RR", "Review: outside 40–180 bpm"],
+            default="Included",
+        ),
     })
-    beat_hr["hr_smooth_bpm"] = beat_hr["hr_bpm"].rolling(5, center=True, min_periods=1).mean()
+    beat_hr["hr_smooth_bpm"] = beat_hr["hr_bpm"].groupby((~valid).cumsum()).transform(
+        lambda group: group.rolling(5, center=True, min_periods=1).mean()
+    ).where(valid)
+    usable_peaks = peak_times[~overlaps_exclusion(peak_times, peak_times, exclusions)]
+    excluded_seconds = np.maximum(
+        0, np.minimum(epoch_ends[:, None], exclusions[:, 1])
+        - np.maximum(epoch_starts[:, None], exclusions[:, 0]),
+    ).sum(axis=1)
+    usable_seconds = np.clip(HR_EPOCH_SECONDS - excluded_seconds, 0, HR_EPOCH_SECONDS)
     epochs = pd.DataFrame({
         "epoch": np.arange(1, len(epoch_starts) + 1),
         "start_s": epoch_starts,
-        "end_s": epoch_starts + HR_EPOCH_SECONDS,
-        "r_peak_count": np.histogram(peak_times, bins=np.r_[epoch_starts, TEST_DURATION_SECONDS])[0],
+        "end_s": epoch_ends,
+        "r_peak_count": np.histogram(usable_peaks, bins=np.r_[epoch_starts, TEST_DURATION_SECONDS])[0],
+        "usable_signal_s": usable_seconds,
+        "usable_signal_pct": 100 * usable_seconds / HR_EPOCH_SECONDS,
     })
     # Assign each valid interval to the epoch containing its later R-peak.
-    grouped = beat_hr.groupby(beat_hr["time_s"] // HR_EPOCH_SECONDS)["hr_bpm"]
+    epoch_index = beat_hr["time_s"] // HR_EPOCH_SECONDS
+    grouped = beat_hr.groupby(epoch_index)["hr_bpm"]
     epochs["valid_rr_count"] = grouped.count().reindex(epochs.index, fill_value=0)
-    epochs["mean_hr_bpm"] = grouped.mean().reindex(epochs.index)
+    epochs["flagged_rr_count"] = pd.Series(review_range).groupby(epoch_index).sum().reindex(epochs.index, fill_value=0)
+    required_coverage = min_coverage if min_coverage is not None else 0
+    low_coverage = epochs["usable_signal_pct"] + 1e-9 < required_coverage
+    epochs["min_usable_signal_pct"] = min_coverage
+    epochs["mean_hr_bpm"] = grouped.mean().reindex(epochs.index).mask(low_coverage)
+    epochs["epoch_status"] = np.select(
+        [low_coverage, epochs["valid_rr_count"] == 0],
+        ["Insufficient coverage", "No valid RR intervals"],
+        default="Reported",
+    )
     return beat_hr, epochs
 
 
@@ -258,7 +294,7 @@ def show_walk_hr(walk, fs, source, output_filename):
     st.write("Detect R-peaks in the trimmed EKG, then review the peaks by 15-second epoch.")
     st.caption(f"Analysis input: {len(time):,} trimmed EKG samples spanning {time[-1]:.3f} s from the selected start.")
     invert_signal = st.checkbox("Invert EKG polarity for R-peak detection")
-    analysis_key = (source, invert_signal)
+    analysis_key = ("review_only", source, invert_signal)
     if st.button("Detect R-peaks"):
         st.session_state.pop("walk_hr_review", None)
         if not np.isfinite(fs) or fs <= 0:
@@ -267,7 +303,7 @@ def show_walk_hr(walk, fs, source, output_filename):
 
         try:
             with st.spinner("Detecting R-peaks in the trimmed EKG..."):
-                clean, detected, auto = detect_r_peaks(walk["signal"], fs, invert_signal)
+                clean, detected, suggested = detect_r_peaks(walk["signal"], fs, invert_signal)
         except ModuleNotFoundError as exc:
             if exc.name != "neurokit2":
                 raise
@@ -277,13 +313,28 @@ def show_walk_hr(walk, fs, source, output_filename):
             st.error(f"Could not detect R-peaks in this walk. {exc}")
             return
 
+        sample_period = 1 / fs
+        gap_indices = np.flatnonzero(np.diff(time) > 1.5 * sample_period)
+        gap_starts = time[gap_indices] + sample_period
+        gap_ends = np.minimum(time[gap_indices + 1], TEST_DURATION_SECONDS)
+        missing_signal = [(a, b) for a, b in zip(gap_starts, gap_ends) if a < b]
+        if time[-1] + sample_period < TEST_DURATION_SECONDS:
+            missing_signal.append((time[-1] + sample_period, TEST_DURATION_SECONDS))
+        detected = detected[time[detected] < TEST_DURATION_SECONDS]
+        if suggested is not None:
+            suggested = np.unique(np.asarray(suggested, dtype=int))
+            suggested = suggested[(suggested >= 0) & (suggested < len(time))]
+            suggested = suggested[time[suggested] < TEST_DURATION_SECONDS]
+
         st.session_state.walk_hr_review = {
             "key": analysis_key,
             "clean": clean,
-            "detected": detected[time[detected] < TEST_DURATION_SECONDS],
-            "auto": auto[time[auto] < TEST_DURATION_SECONDS],
-            "peaks": auto[time[auto] < TEST_DURATION_SECONDS],
+            "auto": detected,
+            "suggested": suggested,
+            "peaks": detected.copy(),
             "history": [],
+            "unreadable": [],
+            "missing_signal": missing_signal,
         }
 
     review = st.session_state.get("walk_hr_review")
@@ -292,7 +343,9 @@ def show_walk_hr(walk, fs, source, output_filename):
 
     clean, peaks = review["clean"], review["peaks"]
     if not review["auto"].size:
-        st.warning("No automatic R-peaks passed the filters. Try inverting the signal or add peaks during review.")
+        st.warning("NeuroKit2 detected no R-peaks. Check the signal polarity or add peaks during review.")
+    if review["suggested"] is None:
+        st.warning("Kubios suggestions could not be calculated. The NeuroKit2 detections are available for review.")
 
     epoch = st.selectbox(
         "Review epoch",
@@ -301,6 +354,41 @@ def show_walk_hr(walk, fs, source, output_filename):
     )
     left, right = (epoch - 1) * HR_EPOCH_SECONDS, epoch * HR_EPOCH_SECONDS
     lo, hi = time.searchsorted([left, right])
+
+    with st.expander("Unreadable signal and epoch coverage"):
+        st.caption(
+            "Mark unreadable stretches using seconds from the walk start. "
+            "Timestamp gaps longer than 1.5 sample periods are flagged automatically."
+        )
+        start_col, end_col = st.columns(2)
+        exclusion_start = start_col.number_input(
+            "Unreadable start (s)", 0.0, float(TEST_DURATION_SECONDS), float(left),
+            step=0.1, key=f"unreadable_start_{epoch}",
+        )
+        exclusion_end = end_col.number_input(
+            "Unreadable end (s)", 0.0, float(TEST_DURATION_SECONDS), float(right),
+            step=0.1, key=f"unreadable_end_{epoch}",
+        )
+        unreadable = review["unreadable"]
+        if st.button("Mark unreadable"):
+            if exclusion_start >= exclusion_end:
+                st.error("The unreadable end must be later than the start.")
+            elif (exclusion_start, exclusion_end) not in unreadable:
+                unreadable.append((exclusion_start, exclusion_end))
+        if unreadable:
+            selection = st.selectbox(
+                "Unreadable stretch to restore", unreadable,
+                format_func=lambda span: f"{span[0]:.3f}–{span[1]:.3f} s", index=None,
+            )
+            if st.button("Restore signal stretch", disabled=selection is None):
+                unreadable.remove(selection)
+                st.rerun()
+        min_coverage = st.number_input(
+            "Minimum usable signal per epoch (%)", 0.0, 100.0, value=None, step=1.0,
+            help="Use your study’s coverage requirement. Leave blank to report any epoch with a usable RR interval.",
+        )
+
+    exclusions = merge_exclusions(review["unreadable"] + review["missing_signal"])
     visible_peaks = peaks[(peaks >= lo) & (peaks < hi)]
     remove_col, add_col, undo_col = st.columns(3)
     if visible_peaks.size:
@@ -344,10 +432,29 @@ def show_walk_hr(walk, fs, source, output_filename):
             current[current != sample] if sample in current else np.union1d(current, [sample])
         )
 
+    beat_hr, epochs = summarize_walk_hr(time, peaks, exclusions, min_coverage)
+    beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + walk["export_start"])
+
     st.caption(
         "Click a diamond or star to remove that peak. Click the EKG trace near a missed peak to add it, "
         "or click a gray × to restore it. Use Undo last peak edit to reverse a change."
     )
+    st.caption(
+        "Purple circles flag weak peaks, unusual RR intervals, or detections Kubios suggests changing. "
+        "Purple triangles show proposed Kubios locations. Check the EKG before editing. "
+        "Shading marks unusable signal."
+    )
+    suggested = review["suggested"] if review["suggested"] is not None else review["auto"]
+    proposed = np.setdiff1d(suggested, review["auto"])
+    amplitude = clean[review["auto"]]
+    positive_amplitude = amplitude[amplitude > 0]
+    weak_threshold = 0.20 * np.median(positive_amplitude) if positive_amplitude.size else 0
+    weak = review["auto"][(amplitude <= 0) | (amplitude < weak_threshold)]
+    flagged = np.union1d(weak, np.setdiff1d(review["auto"], suggested))
+    flagged = np.union1d(flagged, beat_hr.loc[
+        beat_hr["rr_status"].str.startswith("Review"), "walk_sample_idx"
+    ].to_numpy())
+    flagged = np.intersect1d(flagged, peaks)
     # Markers make the waveform samples selectable. WebGL keeps dense epochs responsive.
     fig = go.Figure(go.Scattergl(
         x=time[lo:hi], y=clean[lo:hi], name="EKG", mode="lines+markers",
@@ -355,12 +462,24 @@ def show_walk_hr(walk, fs, source, output_filename):
     ))
     for label, indices, color, symbol in (
         ("Kept automatic peaks", np.intersect1d(peaks, review["auto"]), "#E8790C", "diamond"),
-        ("Removed peaks", np.setdiff1d(review["detected"], peaks), "#737373", "x"),
+        ("Removed peaks", np.setdiff1d(review["auto"], peaks), "#737373", "x"),
         ("Manually added peaks", np.setdiff1d(peaks, review["auto"]), "#1677BB", "star"),
+        ("Flagged for review", flagged, "#9333EA", "circle-open"),
     ):
         visible = indices[(indices >= lo) & (indices < hi)]
         fig.add_scatter(x=time[visible], y=clean[visible], customdata=visible.tolist(), mode="markers", name=label,
-                        marker=dict(size=9, color=color, symbol=symbol))
+                        marker=dict(size=14 if symbol == "circle-open" else 9, color=color, symbol=symbol))
+    visible_proposed = proposed[(proposed >= lo) & (proposed < hi)]
+    fig.add_scatter(
+        x=time[visible_proposed], y=clean[visible_proposed], mode="markers", name="Kubios suggestion",
+        marker=dict(size=10, color="#9333EA", symbol="triangle-up-open"),
+    )
+    visible_exclusions = exclusions[(exclusions[:, 0] < right) & (exclusions[:, 1] > left)]
+    fig.update_layout(shapes=[
+        dict(type="rect", xref="x", yref="paper", x0=max(start, left), x1=min(end, right),
+             y0=0, y1=1, fillcolor="#94A3B8", opacity=0.25, line=dict(width=0), layer="below")
+        for start, end in visible_exclusions
+    ])
     fig.update_xaxes(range=[left, right], title="Time since walk start (s)")
     fig.update_layout(title=f"Cleaned EKG · Epoch {epoch}", yaxis_title="EKG Signal (mV)",
                       height=425, clickmode="event+select", hovermode="closest")
@@ -380,9 +499,6 @@ def show_walk_hr(walk, fs, source, output_filename):
     with st.container(key="walk_peak_edit_plot"):
         st.plotly_chart(fig, use_container_width=True, key=chart_key,
                         on_select=edit_clicked_peak, selection_mode="points")
-
-    beat_hr, epochs = summarize_walk_hr(time, peaks)
-    beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + walk["export_start"])
 
     st.subheader("Participant HR intensity cutoffs")
     st.caption(
@@ -413,8 +529,9 @@ def show_walk_hr(walk, fs, source, output_filename):
 
     st.subheader("Heart rate by 15-second epoch")
     st.caption(
-        "Epochs start at the walk marker. Each average uses unsmoothed HR values from 40–180 bpm, "
-        "assigned by the time of the later R-peak. An epoch with no valid intervals has a blank mean."
+        "Each average uses unsmoothed HR assigned by the later R-peak. RR intervals crossing unusable "
+        "signal are excluded. Values outside 40–180 bpm are flagged for review and included if retained. "
+        "Means are blank for epochs with no valid intervals or coverage below the selected minimum."
     )
     st.caption(
         "Zones use unsmoothed BPM for each beat and mean BPM for each epoch. "
@@ -436,12 +553,21 @@ def show_walk_hr(walk, fs, source, output_filename):
         "time_s": time[peaks],
         "amplitude_mV": clean[peaks],
         "source": np.where(np.isin(peaks, review["auto"]), "automatic", "manual"),
+        "signal_usable": ~overlaps_exclusion(time[peaks], time[peaks], exclusions),
     })
+    review_log = pd.DataFrame(
+        [("Peak added", time[i], np.nan) for i in np.setdiff1d(peaks, review["auto"])]
+        + [("Peak removed", time[i], np.nan) for i in np.setdiff1d(review["auto"], peaks)]
+        + [("Marked unreadable", start, end) for start, end in review["unreadable"]]
+        + [("Missing signal", start, end) for start, end in review["missing_signal"]],
+        columns=["action", "start_s", "end_s"],
+    ).sort_values("start_s")
     stem = output_filename.removesuffix("_trigger_fixed.csv")
-    for column, (label, table, suffix) in zip(st.columns(3), (
+    for column, (label, table, suffix) in zip(st.columns(4), (
         ("Download R-peaks CSV", peak_export, "R_peaks"),
         ("Download beat-to-beat HR CSV", beat_hr, "HR_beat_to_beat"),
         ("Download 15-second HR CSV", epochs, "HR_15s"),
+        ("Download review log CSV", review_log, "HR_review_log"),
     )):
         column.download_button(label, table.to_csv(index=False), f"{stem}_{suffix}.csv", mime="text/csv")
 
