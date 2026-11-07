@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Streamlit app for reconstructing 6MWT EKG triggers from manually recorded real-world clock time
-
-Enters the 6MWT START time.
+Streamlit app for processing a Delsys 6MWT EKG using a recorded Analog 1
+trigger or a manually recorded clock time.
 
 The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) later.
 
@@ -14,11 +13,16 @@ Oct 2026 - v2
 """
 
 import csv
+import hashlib
+from itertools import islice
 # from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+TEST_DURATION_SECONDS = 360
+DEFAULT_ANALOG_THRESHOLD_V = 2.5
 
 # #change save folder
 # SAVE_FOLDER = Path("/Users/beier/Library/CloudStorage/OneDrive-UBC/Courtney's team - Mobility and Balance Rehab Lab - STUDY 3 - STROKE training/Training DATA/training - EKG raw (trigger fixed)/overground")
@@ -29,11 +33,9 @@ st.title("6MWT EKG Trigger Reconstruction")
 
 st.write(
     """
-    Upload a raw Delsys overground EKG CSV file and enter the manually recorded
-    **6MWT start time**.
-
-    The app reconstructs the 6MWT start trigger from the Delsys recording clock
-    and automatically creates a second trigger exactly **6 minutes later**.
+    Upload a raw Delsys overground EKG CSV file. Choose a recorded **Analog 1**
+    trigger or enter the manually recorded **6MWT start time**.
+    The app places the end marker **6 minutes after the selected start**.
     """)
 
 #SESSION STATE
@@ -49,15 +51,8 @@ if "processed_source" not in st.session_state:
 
 def get_csv_rows(uploaded_file,nrows=7):
     uploaded_file.seek(0)
-    raw_bytes = uploaded_file.getvalue()
-    text = raw_bytes.decode("utf-8-sig",errors="replace")
-    reader = csv.reader(text.splitlines())
-    rows = []
-    for i,row in enumerate(reader):
-        rows.append(row)
-        if i >= nrows-1:
-            break
-    return rows
+    lines = (line.decode("utf-8-sig",errors="replace") for line in uploaded_file)
+    return list(islice(csv.reader(lines),nrows))
 
 def extract_recording_metadata(uploaded_file):
     sampling_row = 6
@@ -84,8 +79,29 @@ def extract_recording_metadata(uploaded_file):
         except Exception:
             collection_length = np.nan
 
-    # EKG sampling frequency is in column B of row 7
-    sampling_text = str(rows[sampling_row][1]).replace("Hz","").strip()
+    channel_labels = [label.strip().casefold() for label in rows[5]]
+    channel_pairs = list(zip(channel_labels,channel_labels[1:]))
+    ekg_columns = next(
+        ((i,i+1) for i,(time_label,signal_label) in enumerate(channel_pairs)
+         if time_label.startswith("ekg") and "time series" in time_label
+         and signal_label.startswith("ekg") and "time series" not in signal_label),
+        None,
+    )
+    analog_columns = next(
+        ((i,i+1) for i,(time_label,signal_label) in enumerate(channel_pairs)
+         if time_label == "analog 1 time series (s)" and signal_label == "analog 1 (v)"),
+        None,
+    )
+    if ekg_columns is None:
+        if analog_columns is not None or any(label.startswith("analog ") for label in channel_labels[:2]):
+            raise ValueError("Could not locate the EKG time and signal columns in the Delsys header.")
+        # Legacy EKG-only exports use the first two columns.
+        ekg_columns = (0,1)
+
+    ekg_signal_column = ekg_columns[1]
+    if len(rows[sampling_row]) <= ekg_signal_column:
+        raise ValueError("Could not locate the EKG sampling frequency.")
+    sampling_text = rows[sampling_row][ekg_signal_column].strip().lower().removesuffix("hz").strip()
 
     try:
         ekg_fs = float(sampling_text)
@@ -96,29 +112,45 @@ def extract_recording_metadata(uploaded_file):
         "recording_start":recording_start,
         "collection_length":collection_length,
         "ekg_fs":ekg_fs,
+        "ekg_columns":ekg_columns,
+        "analog_columns":analog_columns,
         "data_start":data_start
     }
 
-def load_ekg(uploaded_file,metadata_info):
+def load_channel(uploaded_file,data_start,columns):
     uploaded_file.seek(0)
 
-    ekg_raw = pd.read_csv(
+    channel = pd.read_csv(
         uploaded_file,
-        skiprows=metadata_info["data_start"],
+        skiprows=data_start,
         header=None,
-        usecols=[0,1],
-        names=["Time","EKG"]
+        usecols=list(columns),
+        skipinitialspace=True,
+        low_memory=False,
     )
+    channel = channel.apply(pd.to_numeric,errors="coerce")
+    samples = channel.to_numpy(dtype=float)
+    return samples[np.isfinite(samples).all(axis=1)].T
 
-    ekg_raw["Time"] = pd.to_numeric(ekg_raw["Time"],errors="coerce")
-    ekg_raw["EKG"] = pd.to_numeric(ekg_raw["EKG"],errors="coerce")
-
-    ekg_raw = ekg_raw.dropna(subset=["Time","EKG"]).reset_index(drop=True)
-
-    if len(ekg_raw) == 0:
+def load_ekg(uploaded_file,metadata_info):
+    times,signal = load_channel(uploaded_file,metadata_info["data_start"],metadata_info["ekg_columns"])
+    if times.size == 0:
         raise ValueError("No valid numeric EKG data found.")
+    return times,signal
 
-    return ekg_raw["Time"].to_numpy(),ekg_raw["EKG"].to_numpy()
+def find_analog_trigger_times(uploaded_file,metadata_info,threshold_v):
+    times,voltage = load_channel(
+        uploaded_file,metadata_info["data_start"],metadata_info["analog_columns"])
+    if times.size < 2:
+        raise ValueError("Analog 1 has too few numeric samples to detect a falling edge.")
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("Analog 1 timestamps must be strictly increasing.")
+
+    # The sample file uses an active-low pulse. A recording that starts low
+    # contains no observed falling edge until the voltage goes high and drops again.
+    low = voltage <= threshold_v
+    falling_edges = np.flatnonzero(~low[:-1] & low[1:])+1
+    return times[falling_edges]
 
 def parse_manual_clock_time(clock_time_string,recording_start):
     clock_time_string = str(clock_time_string).strip()
@@ -162,6 +194,7 @@ def make_ekg_plot(ekg_data,time_vector,trigger_indices=None,trigger_labels=None,
 uploaded_file = st.file_uploader("Upload raw overground Delsys CSV",type=["csv"])
 
 if uploaded_file is not None:
+    file_digest = hashlib.sha256(uploaded_file.getbuffer()).hexdigest()
 
     # LOAD FILE
     try:
@@ -176,27 +209,38 @@ if uploaded_file is not None:
     collection_length = info["collection_length"]
 
     # Make EKG time relative to first EKG sample
-    time_vector = time_vector-time_vector[0]
+    ekg_time_origin = time_vector[0]
+    time_vector = time_vector-ekg_time_origin
+    if np.any(np.diff(time_vector) < 0):
+        st.error("EKG timestamps must be in chronological order.")
+        st.stop()
     calculated_duration = time_vector[-1]
 
-    # CLOCK ALIGNMENT
-    st.subheader("Clock alignment (optional)")
+    has_analog_trigger = info["analog_columns"] is not None
+    use_analog_trigger = False
+    if has_analog_trigger:
+        use_analog_trigger = st.radio(
+            "6MWT start source",
+            ["Recorded Analog 1 trigger","Manual clock time"],
+        ) == "Recorded Analog 1 trigger"
 
-    clock_offset = st.number_input(
-        "How many seconds is the Delsys clock ahead (+) or behind (-)?",
-        value=0.0,
-        step=1.0,
-        help=(
-            "Enter a positive value if the Delsys clock is ahead of the clock "
-            "used to record the 6MWT start time, or a negative value if it is behind. "
-            "For example, if Delsys is 2 minutes ahead, enter 120."
+    clock_offset = 0.0
+    if not use_analog_trigger:
+        st.subheader("Clock alignment (optional)")
+        clock_offset = st.number_input(
+            "How many seconds is the Delsys clock ahead (+) or behind (-)?",
+            value=0.0,
+            step=1.0,
+            help=(
+                "Enter a positive value if the Delsys clock is ahead of the clock "
+                "used to record the 6MWT start time, or a negative value if it is behind."
+            ),
         )
-    )
 
-    st.caption(
-        "Leave at 0 if the clocks are synchronized. "
-        "Example: Delsys 2 min ahead = +120 s; Delsys 1 min behind = -60 s."
-    )
+        st.caption(
+            "Leave at 0 if the clocks are synchronized. "
+            "Example: Delsys 2 min ahead = +120 s; Delsys 1 min behind = -60 s."
+        )
 
     # Shift the entire Delsys recording clock window
     recording_start = delsys_recording_start-pd.to_timedelta(clock_offset,unit="s")
@@ -208,15 +252,17 @@ if uploaded_file is not None:
 
     c1,c2,c3,c4 = st.columns([1.4,1,1,1])
 
-    c1.metric("Corrected recording start",recording_start.strftime("%Y-%m-%d %I:%M:%S %p"))
-    c2.metric("Corrected recording end",recording_end.strftime("%I:%M:%S %p"))
+    clock_label = "Delsys" if use_analog_trigger else "Corrected"
+    c1.metric(f"{clock_label} recording start",recording_start.strftime("%Y-%m-%d %I:%M:%S %p"))
+    c2.metric(f"{clock_label} recording end",recording_end.strftime("%I:%M:%S %p"))
     c3.metric("EKG sampling rate",f"{ekg_fs:.4f} Hz")
     c4.metric("Calculated duration",f"{calculated_duration:.3f} s")
 
-    st.caption(
-        f"Original Delsys metadata start: {delsys_recording_start.strftime('%Y-%m-%d %I:%M:%S %p')} | "
-        f"Clock offset: {clock_offset:+.1f} s"
-    )
+    if not use_analog_trigger:
+        st.caption(
+            f"Original Delsys metadata start: {delsys_recording_start.strftime('%Y-%m-%d %I:%M:%S %p')} | "
+            f"Clock offset: {clock_offset:+.1f} s"
+        )
 
     if not np.isnan(collection_length):
         duration_difference = calculated_duration-collection_length
@@ -237,15 +283,50 @@ if uploaded_file is not None:
     # 6MWT INPUT
     st.subheader("6MWT timing")
 
-    st.write(
-        """
-        Enter the manually recorded clock time when the **6-minute walk test started**.
+    selected_trigger = None
+    threshold_v = None
+    sixmwt_start_clock = None
+    if use_analog_trigger:
+        st.subheader("Recorded Analog 1 triggers")
+        st.write(
+            "Choose the trigger that marks the start of this walk. "
+            "The app sets the end marker 360 seconds later."
+        )
+        threshold_v = st.number_input(
+            "Analog 1 falling-edge threshold (V)",
+            value=DEFAULT_ANALOG_THRESHOLD_V,
+            step=0.1,
+            help="A trigger starts when the voltage drops from above the threshold to at or below it.",
+        )
+        try:
+            analog_times = find_analog_trigger_times(uploaded_file,info,threshold_v)
+        except (ValueError,pd.errors.ParserError) as e:
+            st.error(f"Could not detect Analog 1 triggers. {e}")
+            st.stop()
 
-        The end trigger will automatically be created exactly **360 seconds later**.
-        """)
-
-    st.subheader("6MWT start time")
-    sixmwt_start_clock = st.text_input("**6MWT start time**",placeholder="Example: 10:51:13 AM")
+        trigger_seconds = analog_times-ekg_time_origin
+        if trigger_seconds.size:
+            trigger_options = {
+                f"Trigger {i} at {seconds:.4f} s from EKG start": float(seconds)
+                for i,seconds in enumerate(trigger_seconds,start=1)
+            }
+            selection = st.selectbox(
+                "6MWT start trigger",
+                options=list(trigger_options),
+                index=None,
+                placeholder="Choose the trigger for this walk",
+                key=f"analog_start_{uploaded_file.name}_{file_digest}_{threshold_v}",
+            )
+            if selection is not None:
+                selected_trigger = trigger_options[selection]
+        else:
+            st.warning("No Analog 1 falling edges were detected at this threshold.")
+    else:
+        st.write(
+            "Enter the manually recorded clock time when the **6-minute walk test started**. "
+            "The app sets the end marker 360 seconds later."
+        )
+        sixmwt_start_clock = st.text_input("**6MWT start time**",placeholder="Example: 10:51:13 AM")
 
     # OUTPUT TRIMMING
     st.subheader("Output trimming")
@@ -258,36 +339,48 @@ if uploaded_file is not None:
             "Keep only the 6MWT"],
         index=2)
 
-    # RECONSTRUCT BUTTON
-    if st.button("Reconstruct 6MWT Triggers",type="primary",key="reconstruct_button"):
+    source = (
+        uploaded_file.name,file_digest,
+        use_analog_trigger,threshold_v,selected_trigger,sixmwt_start_clock,clock_offset,trim_choice,
+    )
 
-        try:
-            start_datetime,start_seconds = parse_manual_clock_time(sixmwt_start_clock,recording_start)
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
+    # PROCESS THE SELECTED START
+    if st.button(
+        "Process 6MWT EKG" if use_analog_trigger else "Reconstruct 6MWT Triggers",
+        type="primary",
+        key="reconstruct_button",
+        disabled=use_analog_trigger and selected_trigger is None,
+    ):
+        if use_analog_trigger:
+            start_seconds = selected_trigger
+            start_datetime = recording_start+pd.to_timedelta(start_seconds,unit="s")
+        else:
+            try:
+                start_datetime,start_seconds = parse_manual_clock_time(sixmwt_start_clock,recording_start)
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
 
-        end_seconds = start_seconds+360
-        end_datetime = start_datetime+pd.Timedelta(seconds=360)
+        end_seconds = start_seconds+TEST_DURATION_SECONDS
+        end_datetime = start_datetime+pd.Timedelta(seconds=TEST_DURATION_SECONDS)
 
         if start_seconds < 0:
             st.error(
-                f"The 6MWT start occurs {abs(start_seconds):.2f} s before the corrected "
-                f"EKG recording begins. Check the clock offset.")
+                f"The 6MWT start occurs {abs(start_seconds):.2f} s before the EKG recording begins.")
             st.stop()
 
         if start_seconds > calculated_duration:
             st.error(
-                f"The 6MWT start occurs at {start_seconds:.2f} s after the corrected "
+                f"The 6MWT start occurs at {start_seconds:.2f} s after the "
                 f"recording start, but the recording is only {calculated_duration:.2f} s long.")
             st.stop()
 
-        if end_seconds > calculated_duration:
+        if end_seconds > calculated_duration+1e-8:
             missing_seconds = end_seconds-calculated_duration
             st.error(
                 f"6MWT start: {start_datetime.strftime('%I:%M:%S %p')}\n\n"
                 f"6MWT end: {end_datetime.strftime('%I:%M:%S %p')}\n\n"
-                f"Corrected EKG recording end: {recording_end.strftime('%I:%M:%S %p')}\n\n"
+                f"{clock_label} EKG recording end: {recording_end.strftime('%I:%M:%S %p')}\n\n"
                 f"The EKG recording ends {missing_seconds:.2f} s before the 6MWT ends.")
             st.stop()
 
@@ -310,7 +403,7 @@ if uploaded_file is not None:
             "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
             "Original Sample Index":[start_idx,end_idx]})
 
-        st.subheader("Reconstructed 6MWT triggers")
+        st.subheader("6MWT markers" if use_analog_trigger else "Reconstructed 6MWT triggers")
         st.dataframe(trigger_info,use_container_width=True,hide_index=True)
 
         # ORIGINAL RECORDING PLOT
@@ -320,7 +413,7 @@ if uploaded_file is not None:
             time_vector=time_vector,
             trigger_indices=trigger_indices,
             trigger_labels=trigger_labels,
-            title="EKG with Reconstructed 6MWT Start and End")
+            title="EKG with 6MWT Start and End")
 
         st.plotly_chart(trigger_fig,use_container_width=True)
 
@@ -392,13 +485,13 @@ if uploaded_file is not None:
 
         st.session_state.export_data = export_data
         st.session_state.output_filename = output_filename
-        st.session_state.processed_source = uploaded_file.name
+        st.session_state.processed_source = source
 
-        st.success("✅ 6MWT triggers reconstructed successfully.")
+        st.success("✅ 6MWT EKG processed successfully.")
 
     # OUTPUT PREVIEW
     if (st.session_state.export_data is not None
-        and st.session_state.processed_source == uploaded_file.name):
+        and st.session_state.processed_source == source):
         st.subheader("Output preview")
         st.dataframe(
             st.session_state.export_data.head(100),
@@ -449,6 +542,5 @@ if uploaded_file is not None:
             type="primary",
             key="download_processed_csv"
         )
-
 
 
