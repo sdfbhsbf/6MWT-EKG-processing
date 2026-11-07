@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Streamlit app for processing a Delsys 6MWT EKG using a recorded Analog 1
+Streamlit app for processing a Delsys 6MWT EKG using a recorded
 trigger or a manually recorded clock time.
 
 The app automatically creates the 6MWT END trigger exactly 6 minutes (360 s) later.
 
+EKG cleaning, HR processing, HR intensities
+
 @author: beier
 
-Oct 2026 - v2
+Nov 2026 - v3
 """
 
 import csv
@@ -463,7 +465,7 @@ def show_walk_hr(walk, fs, source, output_filename):
     for label, indices, color, symbol in (
         ("Kept automatic peaks", np.intersect1d(peaks, review["auto"]), "#E8790C", "diamond"),
         ("Removed peaks", np.setdiff1d(review["auto"], peaks), "#737373", "x"),
-        ("Manually added peaks", np.setdiff1d(peaks, review["auto"]), "#1677BB", "star"),
+        ("Manually added peaks", np.setdiff1d(peaks, review["auto"]), "#E8790C", "star"),
         ("Flagged for review", flagged, "#9333EA", "circle-open"),
     ):
         visible = indices[(indices >= lo) & (indices < hi)]
@@ -861,6 +863,9 @@ if uploaded_file is not None:
 
         trigger_export = pd.DataFrame({
             "Trigger Label":["6MWT Start","6MWT End"],
+            "Trigger Onset Times (s)":[
+                output_trigger_times[0],
+                output_trigger_times[1]],
             "6MWT Clock Time":[
                 start_datetime.strftime("%I:%M:%S %p"),
                 end_datetime.strftime("%I:%M:%S %p")],
@@ -871,10 +876,7 @@ if uploaded_file is not None:
                 recording_start.strftime("%I:%M:%S %p"),
                 recording_start.strftime("%I:%M:%S %p")],
             "Delsys Clock Offset (s)":[clock_offset,clock_offset],
-            "Seconds From Corrected Recording Start":[start_seconds,end_seconds],
-            "Trigger Onset Times (s)":[
-                output_trigger_times[0],
-                output_trigger_times[1]]})
+            "Seconds From Corrected Recording Start":[start_seconds,end_seconds]})
 
         export_data = pd.concat([export_data,trigger_export],axis=1)
 
