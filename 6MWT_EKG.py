@@ -15,6 +15,7 @@ Oct 2026 - v2
 import csv
 import hashlib
 from itertools import islice
+from urllib.parse import quote
 # from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -363,8 +364,22 @@ def show_walk_hr(walk, fs, source, output_filename):
     fig.update_xaxes(range=[left, right], title="Time since walk start (s)")
     fig.update_layout(title=f"Cleaned EKG · Epoch {epoch}", yaxis_title="EKG Signal (mV)",
                       height=425, clickmode="event+select", hovermode="closest")
-    st.plotly_chart(fig, use_container_width=True, key=chart_key,
-                    on_select=edit_clicked_peak, selection_mode="points")
+    cursor_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="19" height="19">'
+        '<path d="M9.5 1v5m0 7v5M1 9.5h5m7 0h5" fill="none" '
+        'stroke="#757575" stroke-width="1" shape-rendering="crispEdges"/>'
+        '</svg>'
+    )
+    st.html(f"""
+        <style>
+        .st-key-walk_peak_edit_plot .draglayer .nsewdrag {{
+            cursor: url("data:image/svg+xml,{quote(cursor_svg, safe='')}") 9 9, crosshair !important;
+        }}
+        </style>
+    """)
+    with st.container(key="walk_peak_edit_plot"):
+        st.plotly_chart(fig, use_container_width=True, key=chart_key,
+                        on_select=edit_clicked_peak, selection_mode="points")
 
     beat_hr, epochs = summarize_walk_hr(time, peaks)
     beat_hr.insert(1, "export_sample_idx", beat_hr["walk_sample_idx"] + walk["export_start"])
