@@ -497,7 +497,7 @@ def show_walk_hr(walk, fs, source, output_filename):
         </style>
     """)
     with st.container(key="walk_peak_edit_plot"):
-        st.plotly_chart(fig, width='stretch'=True, key=chart_key,
+        st.plotly_chart(fig, width='stretch', key=chart_key,
                         on_select=edit_clicked_peak, selection_mode="points")
 
     st.subheader("Participant HR intensity cutoffs")
@@ -537,7 +537,7 @@ def show_walk_hr(walk, fs, source, output_filename):
         "Zones use unsmoothed BPM for each beat and mean BPM for each epoch. "
         "Zone labels are blank until all three cutoffs are valid."
     )
-    st.dataframe(epochs, hide_index=True, width='stretch'=True)
+    st.dataframe(epochs, hide_index=True, width='stretch')
 
     hr_fig = go.Figure()
     hr_fig.add_scatter(x=beat_hr["time_s"], y=beat_hr["hr_bpm"], mode="markers", name="Beat-to-beat HR")
@@ -545,7 +545,7 @@ def show_walk_hr(walk, fs, source, output_filename):
     hr_fig.add_scatter(x=(epochs["start_s"] + epochs["end_s"]) / 2, y=epochs["mean_hr_bpm"],
                        mode="markers", name="15-second mean", marker=dict(size=9, symbol="diamond"))
     hr_fig.update_layout(xaxis_title="Time since walk start (s)", yaxis_title="Heart rate (bpm)", height=400)
-    st.plotly_chart(hr_fig, width='stretch'=True)
+    st.plotly_chart(hr_fig, width='stretch')
 
     peak_export = pd.DataFrame({
         "walk_sample_idx": peaks,
@@ -692,7 +692,7 @@ if uploaded_file is not None:
             trigger_labels=list(analog_markers),
             title="Raw Overground EKG",
         )
-        st.plotly_chart(raw_fig,width='stretch'=True)
+        st.plotly_chart(raw_fig,width='stretch')
 
     # 6MWT INPUT
     st.subheader("6MWT timing")
@@ -804,7 +804,7 @@ if uploaded_file is not None:
             "Original Sample Index":[start_idx,end_idx]})
 
         st.subheader("6MWT markers" if use_analog_trigger else "Reconstructed 6MWT triggers")
-        st.dataframe(trigger_info,width='stretch'=True,hide_index=True)
+        st.dataframe(trigger_info,width='stretch',hide_index=True)
 
         # ORIGINAL RECORDING PLOT
 
@@ -815,7 +815,7 @@ if uploaded_file is not None:
             trigger_labels=trigger_labels,
             title="EKG with 6MWT Start and End")
 
-        st.plotly_chart(trigger_fig,width='stretch'=True)
+        st.plotly_chart(trigger_fig,width='stretch')
 
         # TRIM DATA
         walk_slice = slice(start_idx,end_idx+1)
@@ -849,7 +849,7 @@ if uploaded_file is not None:
             trigger_labels=trigger_labels,
             title="Processed 6MWT EKG")
 
-        st.plotly_chart(final_fig,width='stretch'=True)
+        st.plotly_chart(final_fig,width='stretch')
 
         # EXPORT DATA
         output_trigger_times = output_time[output_trigger_indices]
@@ -905,7 +905,7 @@ if uploaded_file is not None:
         st.subheader("Output preview")
         st.dataframe(
             st.session_state.export_data.head(100),
-            width='stretch'=True)
+            width='stretch')
 
         # # SAVE PROCESSED DATA
         # st.divider()
