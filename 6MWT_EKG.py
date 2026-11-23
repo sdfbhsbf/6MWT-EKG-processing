@@ -142,6 +142,18 @@ def load_ekg(uploaded_file,metadata_info):
         raise ValueError("No valid numeric EKG data found.")
     return times,signal
 
+@st.cache_data(max_entries=2, ttl=1800, show_spinner=False)
+def load_ekg_cached(file_bytes):
+    from io import BytesIO
+
+    file_obj = BytesIO(file_bytes)
+    info = extract_recording_metadata(file_obj)
+
+    file_obj.seek(0)
+    time_vector, ekg_data = load_ekg(file_obj, info)
+
+    return info, time_vector, ekg_data
+
 def find_analog_trigger_times(uploaded_file,metadata_info,threshold_v):
     times,voltage = load_channel(
         uploaded_file,metadata_info["data_start"],metadata_info["analog_columns"])
@@ -155,6 +167,20 @@ def find_analog_trigger_times(uploaded_file,metadata_info,threshold_v):
     low = voltage <= threshold_v
     falling_edges = np.flatnonzero(~low[:-1] & low[1:])+1
     return times[falling_edges]
+
+@st.cache_data(max_entries=2, ttl=1800, show_spinner=False)
+def find_analog_triggers_cached(file_bytes, threshold_v):
+    from io import BytesIO
+
+    file_obj = BytesIO(file_bytes)
+    info = extract_recording_metadata(file_obj)
+
+    if info["analog_columns"] is None:
+        return np.array([])
+
+    return find_analog_trigger_times(
+        file_obj, info, threshold_v
+    )
 
 def parse_manual_clock_time(clock_time_string,recording_start):
     clock_time_string = str(clock_time_string).strip()
@@ -579,12 +605,12 @@ def show_walk_hr(walk, fs, source, output_filename):
 uploaded_file = st.file_uploader("Upload raw overground Delsys CSV",type=["csv"])
 
 if uploaded_file is not None:
-    file_digest = hashlib.sha256(uploaded_file.getbuffer()).hexdigest()
+    file_bytes = uploaded_file.getvalue()
+    file_digest = hashlib.sha256(file_bytes).hexdigest()
 
-    # LOAD FILE
+    # LOAD FILE (CACHED)
     try:
-        info = extract_recording_metadata(uploaded_file)
-        time_vector,ekg_data = load_ekg(uploaded_file,info)
+        info, time_vector, ekg_data = load_ekg_cached(file_bytes)
     except Exception as e:
         st.error(f"Could not read the Delsys file:\n\n{e}")
         st.stop()
@@ -672,7 +698,7 @@ if uploaded_file is not None:
             help="A trigger starts when the voltage drops from above the threshold to at or below it.",
         )
         try:
-            analog_times = find_analog_trigger_times(uploaded_file,info,threshold_v)
+            analog_times = find_analog_triggers_cached(file_bytes, threshold_v)
         except (ValueError,pd.errors.ParserError) as e:
             st.error(f"Could not detect Analog 1 triggers. {e}")
         else:
